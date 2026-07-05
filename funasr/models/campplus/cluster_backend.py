@@ -214,7 +214,7 @@ class ClusterBackend(torch.nn.Module):
     def forward(self, X, **params):
         # clustering and return the labels
         """Forward pass for training.
-        
+
             Args:
                 X: TODO.
                 **params: Additional keyword arguments.
@@ -228,10 +228,47 @@ class ClusterBackend(torch.nn.Module):
             labels = self.spectral_cluster(X, k)
         else:
             labels = self.umap_hdbscan_cluster(X)
+            # umap_hdbscan_cluster is density-based (HDBSCAN) and has no speaker-count concept at
+            # all, unlike spectral_cluster which already bounds its eigengap search window to
+            # max_num_spks. A long/dense recording (>=2048 embeddings) silently bypassed the
+            # configured speaker cap end to end. Enforce the same bound here post-hoc.
+            if k is None and len(set(labels.tolist())) > self.spectral_cluster.max_num_spks:
+                labels = self.merge_to_max_spks(labels, X, self.spectral_cluster.max_num_spks)
 
         if k is None and "merge_thr" in self.model_config:
             labels = self.merge_by_cos(labels, X, self.model_config["merge_thr"])
 
+        return labels
+
+    def merge_to_max_spks(self, labels, embs, max_num_spks):
+        """Greedily merge the closest pair of clusters (by centroid cosine similarity) until at
+        most max_num_spks remain. Retrofits a speaker-count cap onto clustering paths (e.g.
+        umap_hdbscan_cluster) that have no such parameter of their own, unlike spectral_cluster
+        which already bounds its eigengap search window to max_num_spks.
+
+            Args:
+                labels: cluster label per row of embs (contiguous ints starting at 0).
+                embs: the embeddings that were clustered into labels.
+                max_num_spks: the cap to merge down to.
+            """
+        while True:
+            spk_num = labels.max() + 1
+            if spk_num <= max_num_spks:
+                break
+            spk_center = []
+            for i in range(spk_num):
+                spk_emb = embs[labels == i].mean(0)
+                spk_center.append(spk_emb)
+            spk_center = np.stack(spk_center, axis=0)
+            norm_spk_center = spk_center / np.linalg.norm(spk_center, axis=1, keepdims=True)
+            affinity = np.matmul(norm_spk_center, norm_spk_center.T)
+            affinity = np.triu(affinity, 1)
+            spks = np.unravel_index(np.argmax(affinity), affinity.shape)
+            for i in range(len(labels)):
+                if labels[i] == spks[1]:
+                    labels[i] = spks[0]
+                elif labels[i] > spks[1]:
+                    labels[i] -= 1
         return labels
 
     def merge_by_cos(self, labels, embs, cos_thr):
